@@ -1,104 +1,89 @@
-# DolphinScheduler 与 EMR Hue 基于 Keycloak 的 SSO 方案
+# DolphinScheduler 3.2.1 + EMR Hue 基于 Keycloak 的 SSO 部署指南
 
-通过自建 **Keycloak** 作为统一 OIDC 身份源，实现 **Apache DolphinScheduler 3.2.1** 与 **Amazon EMR Hue 4.11** 的单点登录（登录任一系统后，访问另一个自动登录），并在 DolphinScheduler 顶部提供一键跳转 Hue 的入口。
+通过自建 **Keycloak**（OIDC IdP）实现 **Apache DolphinScheduler 3.2.1** 与 **Amazon EMR Hue 4.11** 的单点登录：登录任一系统后访问另一个免再次输密码；并在 DolphinScheduler 提供一键跳转 Hue 的入口。
 
-> 环境：AWS us-east-1 / 账户 828414850215。本文 IP、密钥等为示例环境值，落地时请替换为你自己的。
+本文是**可照做的分步指南**，包含 DS 3.2.1 原生 OAuth2 的若干坑及其修复（缺 `scope`、locale cookie 导致 500 等）。
+
+> 文中 IP / 密钥为示例环境值（AWS us-east-1），照做时替换为你自己的。
+> 三台机器：DS 主机 `3.89.105.183`、EMR master `3.238.31.232`、Keycloak `54.221.153.237`（本指南新建）。
 
 ---
 
-## 1. 背景与架构
+## 目录
+1. [架构与原理](#1-架构与原理)
+2. [前置条件](#2-前置条件)
+3. [第一步：部署 Keycloak](#3-第一步部署-keycloak)
+4. [第二步：配置 Keycloak（realm/用户/客户端/映射器）](#4-第二步配置-keycloakrealm用户客户端映射器)
+5. [第三步：部署 DS token 适配器](#5-第三步部署-ds-token-适配器)
+6. [第四步：配置 DolphinScheduler 后端](#6-第四步配置-dolphinscheduler-后端)
+7. [第五步：修复 DS 前端三个坑](#7-第五步修复-ds-前端三个坑必做)
+8. [第六步：配置 EMR Hue](#8-第六步配置-emr-hue)
+9. [第七步：验证](#9-第七步验证)
+10. [访问方式](#10-访问方式)
+11. [回滚](#11-回滚)
+12. [安全与生产化建议](#12-安全与生产化建议)
+13. [排错 FAQ](#13-排错-faq)
 
-### 1.1 初始环境
-| 组件 | 位置 | 说明 |
+---
+
+## 1. 架构与原理
+
+```
+                       ┌──────────────────────────────┐
+                       │  Keycloak (OIDC IdP)          │
+                       │  http://54.221.153.237:8080   │
+                       │  realm: sso                   │
+                       └───────────────┬──────────────┘
+       authorize(浏览器,公网) / token / userinfo (OIDC)
+            ┌──────────────────────────┼─────────────────────────┐
+            │                          │                          │
+ ┌──────────▼──────────┐      ┌────────▼─────────┐                │
+ │ DolphinScheduler     │      │ EMR Hue 4.11     │                │
+ │ 3.89.105.183:12345   │      │ 3.238.31.232:8888│ 标准 OIDC 直连  │
+ │  原生 OAuth2(GitHub  │      └──────────────────┘                │
+ │  方言)               │                                          │
+ │     │ token 请求格式不标准                                       │
+ │     ▼                                                          │
+ │  token 适配器 :9000  │── 翻译 token 请求 → 标准表单 POST ────────┘
+ └─────────────────────┘
+```
+
+**为什么 DS 需要一个适配器**：DolphinScheduler 3.2.1 的内置 OAuth2 是按 GitHub 协议方言写死的，与标准 OIDC 有三处不兼容，必须分别绕过（本指南均不改 DS 源码）：
+
+| 不兼容点 | 现象 | 解决办法 |
 |---|---|---|
-| DolphinScheduler 3.2.1 | EC2 `i-00fcc919f5b2773e8`（Ubuntu，t3.medium，公网 `3.89.105.183`） | Docker 容器 `apache/dolphinscheduler-standalone-server:3.2.1`，端口 `12345`，路径前缀 `/dolphinscheduler` |
-| EMR 集群（含 Hue） | EMR `j-11R1505MDSXUG`，master `i-0559072c85ddfb04a`（Amazon Linux，公网 `3.238.31.232`） | emr-7.12.0；Hue 4.11 端口 `8888`（systemd `hue.service`，配置 `/etc/hue/conf/hue.ini`） |
+| userInfo 用户名字段写死取 `login` | 取不到用户名 → 建用户 NPE | Keycloak 加 protocol mapper：`username` → 声明 `login` |
+| token 请求把参数放 URL query、`client_secret` 放 JSON body | Keycloak 报 `Missing form parameter: grant_type` | 部署 token 适配器翻译成标准表单 POST |
+| 前端 authorize URL 漏带 `scope=openid` | 签发非 OIDC token → userInfo 返回 **403** → NPE | 前端注入 `scope=openid`（第五步） |
 
-### 1.2 目标
-- 登录一个系统后，访问另一个免再次输密码（真 SSO）。
-- DolphinScheduler 界面提供跳转 Hue 的入口。
-
-### 1.3 最终架构
-```
-                         ┌─────────────────────────────┐
-                         │   Keycloak (OIDC IdP)        │
-                         │   EC2 i-0441666ff549149b7    │
-                         │   http://54.221.153.237:8080 │
-                         │   realm: sso                 │
-                         └──────────────┬──────────────┘
-              authorize/token/userinfo  │  (OIDC)
-              ┌─────────────────────────┼───────────────────────────┐
-              │                         │                           │
-   ┌──────────▼───────────┐   ┌─────────▼──────────┐                │
-   │ DolphinScheduler 3.2.1│   │  EMR Hue 4.11      │                │
-   │ 3.89.105.183:12345    │   │  3.238.31.232:8888 │                │
-   │                       │   │  (标准 OIDC 直连)   │                │
-   │  OAuth2(GitHub 方言)  │                                          │
-   │     │                 │                                          │
-   │     ▼                 │                                          │
-   │  token 适配器(:9000)  │── 翻译 token 请求格式 ────────────────────┘
-   │  systemd ds-oauth-... │
-   └───────────────────────┘
-```
-
-### 1.4 为什么 DolphinScheduler 需要一个“适配器”
-DolphinScheduler 3.2.1 的内置 OAuth2（`LoginController.loginByAuth2`）是**按 GitHub 协议方言写死的**，与标准 OIDC（Keycloak/Cognito）有三处不兼容：
-
-1. **用户名字段写死取 `login`**：`JSONUtils.getNodeString(userInfoJsonStr, "login")`，而标准 OIDC userInfo 返回 `sub/preferred_username/email`，没有 `login`。
-2. **token 请求格式非标准**：把 `client_id/code/grant_type/redirect_uri` 放在 **URL query**、`client_secret` 放在 **JSON body**（`Content-Type: application/json`）；而 OIDC token 端点要求 `application/x-www-form-urlencoded` 表单体。
-3. **redirect_uri 追加 `?provider=xxx`**，且前端拼 authorize URL 时**漏带 `scope=openid`**。
-
-> 通用化 OIDC 是 DolphinScheduler GSoC 2025（4.x 之后）才加入的，3.2.1 不具备。Amazon Cognito 还额外强制回调必须 HTTPS（实测 `cannot use the HTTP protocol`），因此本方案改用可关闭 SSL 强制、可加协议映射器的 **Keycloak**。
-
-解决办法（全部不改 DS 源码）：
-- 用 Keycloak 的 **protocol mapper** 把 `username` 映射成名为 `login` 的声明 → 解决第 1 点。
-- 部署一个**极小的 token 适配器**，把 DS 的 token 请求翻译成标准表单 POST → 解决第 2 点。
-- Keycloak 客户端用 **public client + 通配 redirectUri**，并**在前端 bundle 注入 `scope=openid`** → 解决第 3 点。
+> 另外 DS 前端登录流程会 `DELETE /cookies` 把 `language` cookie 值置为 null，触发 Spring `CookieLocaleResolver` NPE → **登录偶发 500**，也需在第五步修复。
+> 通用 OIDC 是 DS GSoC 2025（4.x 之后）才支持，3.2.1 没有。Amazon Cognito 还强制回调必须 HTTPS（`cannot use the HTTP protocol`），故本方案用可关 SSL 强制、可加映射器的 **Keycloak**。
 
 ---
 
-## 2. 组件与关键参数
-
-### 2.1 Keycloak
-- 实例：`i-0441666ff549149b7`，t3.medium，公网 `54.221.153.237`，私网 `172.31.19.154`，端口 `8080`。
-- 安全组 `sg-0ebab7034d046a73f`：入站放行 `8080`。
-- 容器：`quay.io/keycloak/keycloak:25.0.6`，`start-dev`，数据卷 `/opt/keycloak-data`。
-- 管理员：`admin` / `Adm1n-Keycloak-2026`，管理台 `http://54.221.153.237:8080/admin`。
-- Realm：`sso`（`sslRequired=NONE`）。
-- 测试用户：`testuser` / `Test@12345`。
-
-### 2.2 Keycloak OIDC 端点（realm `sso`）
-| 用途 | URL |
-|---|---|
-| issuer / base | `http://54.221.153.237:8080/realms/sso` |
-| authorize | `.../protocol/openid-connect/auth` |
-| token | `.../protocol/openid-connect/token` |
-| userinfo | `.../protocol/openid-connect/userinfo` |
-| jwks | `.../protocol/openid-connect/certs` |
-| logout | `.../protocol/openid-connect/logout` |
-
-### 2.3 客户端
-| 客户端 | 类型 | 回调 URL | 备注 |
-|---|---|---|---|
-| `dolphinscheduler` | public | `http://3.89.105.183:12345/dolphinscheduler/redirect/login/oauth2*` | 含 `login` protocol mapper（username→login） |
-| `hue` | confidential | `http://3.238.31.232:8888/oidc/callback/*` | secret：`ufQbvE7gGEk6daKDVrzEVAIFmv34VqGt` |
+## 2. 前置条件
+- DS 以容器 `apache/dolphinscheduler-standalone-server:3.2.1` 运行（端口 12345，路径前缀 `/dolphinscheduler`）。
+  - ⚠️ 注意运行的是**容器内** `/opt/dolphinscheduler/conf/application.yaml`，不是宿主机解压包。
+- EMR（含 Hue 4.11，端口 8888，systemd `hue.service`，配置 `/etc/hue/conf/hue.ini`）。
+- 三台机器两两网络可达（Keycloak 8080 需对浏览器和两台业务机开放）。
+- 能在三台机器上执行命令（本文用 AWS SSM；用 SSH 亦可）。
+- DS 主机已装 Docker + python3。
 
 ---
 
-## 3. 配置步骤
+## 3. 第一步：部署 Keycloak
 
-### 3.1 启动 Keycloak（独立 EC2）
-> DolphinScheduler 主机内存紧张（4G 总量、可用 ~360MB、无 swap、DS 已占用约 3.2G），不能同居 Keycloak，故用独立实例。
+> DS 主机内存紧张（4G / Xmx4g / 无 swap），**不要**与 DS 同居 Keycloak，单独开一台（如 t3.medium）。
 
-安全组：
+**安全组**（开放 8080）：
 ```bash
 aws ec2 create-security-group --group-name keycloak-sso-sg \
-  --description "Keycloak OIDC IdP" --vpc-id <vpc-id>
+  --description "Keycloak OIDC IdP" --vpc-id <你的VPC>
 aws ec2 authorize-security-group-ingress --group-id <sg-id> \
   --ip-permissions IpProtocol=tcp,FromPort=8080,ToPort=8080,IpRanges='[{CidrIp=0.0.0.0/0}]'
 ```
 
-实例 user-data（AL2023）：
+**实例 user-data**（Amazon Linux 2023，自动装 Docker + 跑 Keycloak）：
 ```bash
 #!/bin/bash
 dnf install -y docker
@@ -110,13 +95,18 @@ docker run -d --name keycloak --restart always -p 8080:8080 \
   -v /opt/keycloak-data:/opt/keycloak/data \
   quay.io/keycloak/keycloak:25.0.6 start-dev
 ```
+等待就绪：`curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/realms/master` 返回 `200`。
 
-### 3.2 创建 realm / 用户 / 客户端 / 映射器（kcadm，在 Keycloak 容器内）
+---
+
+## 4. 第二步：配置 Keycloak（realm/用户/客户端/映射器）
+
+在 Keycloak 容器内用 `kcadm.sh` 执行：
 ```bash
 KC=/opt/keycloak/bin/kcadm.sh
 $KC config credentials --server http://localhost:8080 --realm master --user admin --password 'Adm1n-Keycloak-2026'
 
-# realm（关闭 SSL 强制，便于 HTTP POC）
+# realm：关闭 SSL 强制（HTTP POC 必需）
 $KC create realms -s realm=sso -s enabled=true -s sslRequired=NONE
 
 # 测试用户
@@ -124,34 +114,41 @@ $KC create users -r sso -s username=testuser -s enabled=true \
   -s email=testuser@example.com -s emailVerified=true -s firstName=Test -s lastName=User
 $KC set-password -r sso --username testuser --new-password 'Test@12345'
 
-# DolphinScheduler：public client + 通配 redirectUri
+# DolphinScheduler 客户端：public + 通配 redirectUri
 DSID=$($KC create clients -r sso -s clientId=dolphinscheduler -s enabled=true \
   -s publicClient=true -s standardFlowEnabled=true -s directAccessGrantsEnabled=true \
   -s 'redirectUris=["http://3.89.105.183:12345/dolphinscheduler/redirect/login/oauth2*","http://3.89.105.183:12345/dolphinscheduler/*"]' \
   -s 'webOrigins=["*"]' -i)
 
-# 关键：把 username 映射成名为 "login" 的声明（DS 写死读 login）
+# 关键：把 username 映射成名为 login 的声明（DS 写死读 userInfo 的 "login"）
 $KC create clients/$DSID/protocol-mappers/models -r sso \
   -s name=login-mapper -s protocol=openid-connect \
   -s protocolMapper=oidc-usermodel-property-mapper \
   -s 'config={"user.attribute":"username","claim.name":"login","jsonType.label":"String","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}'
 
-# Hue：confidential client
+# Hue 客户端：confidential
 HUEID=$($KC create clients -r sso -s clientId=hue -s enabled=true \
   -s publicClient=false -s standardFlowEnabled=true \
   -s 'redirectUris=["http://3.238.31.232:8888/oidc/callback/*","http://3.238.31.232:8888/*"]' \
   -s 'webOrigins=["*"]' -i)
-$KC get clients/$HUEID/client-secret -r sso   # 取 Hue client secret
+$KC get clients/$HUEID/client-secret -r sso   # 记下 Hue client secret，第六步用
 ```
 
-### 3.3 DolphinScheduler token 适配器
-作用：仅翻译 **token 端点**。接收 DS 的“query 参数 + JSON body”请求，转成标准表单 POST 给 Keycloak，原样回传响应。authorize 与 userinfo 由 DS 直连 Keycloak。
+OIDC 端点（realm `sso`）：
+- authorize: `http://54.221.153.237:8080/realms/sso/protocol/openid-connect/auth`
+- token: `.../token`  ·  userinfo: `.../userinfo`  ·  jwks: `.../certs`
 
-- 部署在 DS 主机（python3 标准库，无依赖），systemd 服务 `ds-oauth-adapter`，监听 `0.0.0.0:9000`。
-- DS 容器（bridge 网络，网关 `172.17.0.1`）通过 `http://172.17.0.1:9000/token` 访问。
-- 适配器上游指向 Keycloak `token` 端点（用公网 `54.221.153.237`，保证 issuer 与 authorize 一致）。
+> **issuer 一致性**：authorize（浏览器侧，必须公网 IP）与 token/userinfo（后端侧）务必使用**同一 host**（本文统一用公网 `54.221.153.237`），否则 token 的 `iss` 与 userinfo 校验 host 不符会导致 401/403。
 
-`/opt/ds-oauth-adapter/adapter.py`（核心逻辑）：
+---
+
+## 5. 第三步：部署 DS token 适配器
+
+作用：只翻译 **token 端点**——把 DS 的「query 参数 + JSON body」请求转成标准 `application/x-www-form-urlencoded` 表单 POST 给 Keycloak，原样回传。authorize、userInfo 由 DS 直连 Keycloak。
+
+DS 容器是 bridge 网络（网关 `172.17.0.1`），所以适配器跑在**宿主机** `0.0.0.0:9000`，DS 通过 `http://172.17.0.1:9000/token` 访问。
+
+`/opt/ds-oauth-adapter/adapter.py`：
 ```python
 #!/usr/bin/env python3
 import json, urllib.parse, urllib.request, urllib.error
@@ -203,66 +200,102 @@ WantedBy=multi-user.target
 ```
 ```bash
 systemctl daemon-reload && systemctl enable --now ds-oauth-adapter
+curl -s http://127.0.0.1:9000/health   # {"status":"ok"}
 ```
 
-### 3.4 DolphinScheduler OAuth2 配置
-编辑**容器内** `/opt/dolphinscheduler/conf/application.yaml`（注意不是宿主机的解压包，运行的是容器），`security.authentication.oauth2`：
+---
+
+## 6. 第四步：配置 DolphinScheduler 后端
+
+编辑**容器内** `/opt/dolphinscheduler/conf/application.yaml`，`security.authentication.oauth2`：
 ```yaml
     oauth2:
-      enable: true            # 附加 OAuth2 登录；type 仍为 PASSWORD，保留密码登录兜底
+      enable: true            # type 仍保持 PASSWORD，保留密码登录兜底
       provider:
         keycloak:
           authorizationUri: "http://54.221.153.237:8080/realms/sso/protocol/openid-connect/auth"
           redirectUri: "http://3.89.105.183:12345/dolphinscheduler/redirect/login/oauth2"
           clientId: "dolphinscheduler"
-          clientSecret: ""                         # public client，留空
-          tokenUri: "http://172.17.0.1:9000/token" # 经适配器
+          clientSecret: ""                          # public client 留空
+          tokenUri: "http://172.17.0.1:9000/token"  # 经适配器
           userInfoUri: "http://54.221.153.237:8080/realms/sso/protocol/openid-connect/userinfo"
           callbackUrl: "http://3.89.105.183:12345/dolphinscheduler/ui/login"
           iconUri: ""
           provider: keycloak
 ```
-应用：`docker cp` 回容器后 `docker restart dolphinscheduler`。验证：
+应用：
 ```bash
-curl -s http://localhost:12345/dolphinscheduler/oauth2-provider   # 应返回 keycloak provider
+docker cp app.yaml dolphinscheduler:/opt/dolphinscheduler/conf/application.yaml
+docker restart dolphinscheduler   # standalone 启动约 1-2 分钟
+# 验证（应返回 keycloak provider）：
+curl -s http://localhost:12345/dolphinscheduler/oauth2-provider
 ```
 
-### 3.5 前端注入 `scope=openid`（关键修复）
-DS 3.2.1 前端拼 authorize URL 时漏带 `scope`，导致 Keycloak 签发非 OIDC token、userInfo 返回 403。在前端 bundle 注入：
+---
+
+## 7. 第五步：修复 DS 前端三个坑（必做）
+
+DS 3.2.1 的前端编译产物有两个会导致登录失败的问题，且顶部按钮会和菜单重叠。以下都是对**容器内** UI 静态文件的修改，**无需重启**，但浏览器需强制刷新（文件名不变会被缓存）。
+
+> 先定位前端主 bundle 文件名（形如 `index.<hash>.js`）：
+> ```bash
+> docker exec dolphinscheduler ls /opt/dolphinscheduler/ui/assets/ | grep -E '^index\.[0-9a-f]+\.js$'
+> ```
+> 下文以 `index.1f78923c.js` 为例。
+
+### 7.1 注入 `scope=openid`（否则 userInfo 403 → 登录失败）
+DS 前端拼 authorize URL 时漏了 `scope`。注入：
 ```bash
-F=/opt/dolphinscheduler/ui/assets/index.<hash>.js
+F=/opt/dolphinscheduler/ui/assets/index.1f78923c.js
 docker exec dolphinscheduler sh -c "cp -n $F ${F}.orig; \
   sed -i 's#response_type=code&redirect_uri=#response_type=code\&scope=openid\&redirect_uri=#g' $F"
 ```
-（静态文件，无需重启；浏览器需强制刷新 Ctrl+Shift+R 以加载新 JS。）
 
-### 3.6 DolphinScheduler 顶部 Hue 跳转入口
-DS 顶栏由编译后的 Vue 渲染，无法直接改标签。在容器内 `/opt/dolphinscheduler/ui/index.html` 注入一段脚本，在右上角加固定悬浮按钮 “Hue ↗”，点击新标签打开 Hue：
-```html
-<script>
-(function () {
-  var HUE_URL = 'http://3.238.31.232:8888';
-  function ensureLink() {
-    if (document.getElementById('hue-quick-link')) return;
-    var a = document.createElement('a');
-    a.id='hue-quick-link'; a.href=HUE_URL; a.target='_blank'; a.rel='noopener'; a.textContent='Hue \u2197';
-    a.style.cssText='position:fixed;top:14px;right:200px;z-index:99999;height:34px;line-height:34px;padding:0 16px;background:#1890ff;color:#fff;font-weight:600;border-radius:17px;text-decoration:none;box-shadow:0 2px 6px rgba(0,0,0,.2)';
-    document.body.appendChild(a);
-  }
-  function tick(){ if(!/\/login\b/.test(location.hash+location.pathname)) ensureLink();
-    else { var e=document.getElementById('hue-quick-link'); if(e) e.remove(); } }
-  window.addEventListener('load',tick); window.addEventListener('hashchange',tick); setInterval(tick,1000);
-})();
-</script>
+### 7.2 关闭前端 `DELETE /cookies`（否则偶发登录 500）
+DS 前端登录流程调用 `DELETE /cookies`，把 `language` cookie 值置为 null；该空值 cookie 被带到 OAuth 回调时触发 Spring `CookieLocaleResolver` 空指针（`CookieLocaleResolver.java:226`，对 null 值 `indexOf` ）→ 500。把该调用改为空操作：
+```bash
+F=/opt/dolphinscheduler/ui/assets/index.1f78923c.js
+docker exec dolphinscheduler sh -c "cp -n $F ${F}.bak-cookiefix; \
+  sed -i 's#function ae(){return f({url:\"/cookies\",method:\"delete\"})}#function ae(){return Promise.resolve()}#' $F"
 ```
+> 注意：`ae` 是压缩后的函数名，不同构建可能不同。先 `grep -o '....url:\"/cookies\",method:\"delete\".....' $F` 找到实际函数名再替换。
 
-### 3.7 EMR Hue OIDC 配置
-编辑 master 上 `/etc/hue/conf/hue.ini`：
-- `[desktop] [[auth]]`：`backend=desktop.auth.backend.OIDCBackend`
-- `[desktop] [[oidc]]` 段（全部用公网端点，保证 issuer 一致）：
+### 7.3 Hue 跳转按钮 + language cookie 守护（注入 index.html）
+DS 顶栏由编译后的 Vue 渲染，无法直接改标签；在 `index.html` 的 `</body>` 前注入脚本：右下角加悬浮 “Hue ↗” 按钮（放右下角避免与顶部菜单重叠），并守护 `language` cookie 始终为合法值（双保险）。
+
+```html
+    <script>
+    (function(){
+      function getLang(){var m=document.cookie.match(/(?:^|;\s*)language=([^;]*)/);return m?decodeURIComponent(m[1]):'';}
+      function ensureLang(){var v=getLang();if(v!=='zh_CN'&&v!=='en_US'){document.cookie='language=zh_CN; path=/; max-age=31536000';}}
+      ensureLang();document.addEventListener('DOMContentLoaded',ensureLang);
+      window.addEventListener('pagehide',ensureLang);window.addEventListener('beforeunload',ensureLang);setInterval(ensureLang,1000);
+    })();
+    (function(){
+      var HUE_URL='http://3.238.31.232:8888';
+      function ensureLink(){if(document.getElementById('hue-quick-link'))return;var a=document.createElement('a');a.id='hue-quick-link';a.href=HUE_URL;a.target='_blank';a.rel='noopener noreferrer';a.title='Open EMR Hue';a.textContent='Hue \u2197';a.style.cssText='position:fixed;bottom:28px;right:28px;z-index:99999;height:40px;line-height:40px;padding:0 18px;background:#1890ff;color:#fff;font-size:14px;font-weight:600;border-radius:20px;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,.25);cursor:pointer';a.onmouseover=function(){a.style.background='#40a9ff';};a.onmouseout=function(){a.style.background='#1890ff';};document.body.appendChild(a);}
+      function shouldShow(){return !/\/login\b/.test(location.hash+location.pathname);}
+      function tick(){var e=document.getElementById('hue-quick-link');if(shouldShow())ensureLink();else if(e)e.remove();}
+      window.addEventListener('load',tick);document.addEventListener('DOMContentLoaded',tick);window.addEventListener('hashchange',tick);setInterval(tick,1000);
+    })();
+    </script>
+```
+> 落地技巧：先 `docker cp` 取出 index.html，用脚本在 `</body>` 前插入上面这段，再 `docker cp` 回去。**注意编码**：通过 shell/base64 传大文件时，注释里别用中文，避免传输损坏（建议纯 ASCII）。
+
+---
+
+## 8. 第六步：配置 EMR Hue
+
+编辑 master 的 `/etc/hue/conf/hue.ini`：
+
+`[desktop] > [[auth]]`：
+```ini
+    backend=desktop.auth.backend.OIDCBackend
+```
+`[desktop] > [[oidc]]`（全部用公网端点，保证 issuer 一致；secret 用第二步记下的）：
 ```ini
     oidc_rp_client_id=hue
-    oidc_rp_client_secret=ufQbvE7gGEk6daKDVrzEVAIFmv34VqGt
+    oidc_rp_client_secret=<第二步的 Hue client secret>
     oidc_op_authorization_endpoint=http://54.221.153.237:8080/realms/sso/protocol/openid-connect/auth
     oidc_op_token_endpoint=http://54.221.153.237:8080/realms/sso/protocol/openid-connect/token
     oidc_op_user_endpoint=http://54.221.153.237:8080/realms/sso/protocol/openid-connect/userinfo
@@ -275,70 +308,81 @@ DS 顶栏由编译后的 Vue 渲染，无法直接改标签。在容器内 `/opt
     login_redirect_url_failure=http://3.238.31.232:8888/hue/oidc_failed/
     create_users_on_login=true
 ```
-应用：`sudo systemctl restart hue`（启动需 1-2 分钟，会跑 migrate）。
+应用：`sudo systemctl restart hue`（启动需 1-2 分钟，会跑 migrate）。验证：`curl -s -o /dev/null -w '%{http_code}' http://localhost:8888/` 应为 302（跳转 Keycloak）。
 
 ---
 
-## 4. 访问与使用
+## 9. 第七步：验证
 
-| 系统 | 地址 | 说明 |
-|---|---|---|
-| DolphinScheduler | `http://3.89.105.183:12345/dolphinscheduler` | 登录页有 Keycloak 登录按钮（也保留密码登录）；右上角 “Hue ↗” 跳转 |
-| EMR Hue | `http://3.238.31.232:8888` | 自动跳转 Keycloak |
-| Keycloak 管理台 | `http://54.221.153.237:8080/admin` | `admin` / `Adm1n-Keycloak-2026` |
-| 测试用户 | — | `testuser` / `Test@12345` |
-
-**SSO 体验**：先登任意一个（Keycloak 输一次密码），再访问另一个时浏览器携带 Keycloak 会话，直接放行、无需再次登录。
-
----
-
-## 5. 验证
-
-DolphinScheduler 服务端链路（脚本化模拟浏览器全流程）结果：
+后端链路（脚本化模拟浏览器全流程，应得 PASS）：
 ```
 login_form_action_found=yes
-post_creds_http=302 redirect_to=.../redirect/login/oauth2?provider=keycloak&state=...
 AUTH_CODE_OBTAINED=yes
-TOKEN_VIA_ADAPTER=OK                # 适配器用真实 code 换到 access_token
-USERINFO_login_claim='testuser'     # userInfo 返回 login（DS 据此建用户/登录）
+TOKEN_VIA_ADAPTER=OK            # 适配器用真实 code 换到 access_token
+USERINFO_login_claim='testuser' # userInfo 含 login
 END_TO_END_RESULT=PASS
 ```
-打 DS 真实回调端点 `/dolphinscheduler/redirect/login/oauth2`（带 scope）：
+打 DS 真实回调端点（带 `scope`、无坏 cookie）应得：
 ```
-DS_HTTP=302
-DS_REDIRECT_LOCATION=.../ui/login?sessionId=...&authType=oauth2
-RESULT=DS_LOGIN_SUCCESS
+DS_HTTP=302  loc=.../ui/login?sessionId=...&authType=oauth2
 ```
-Hue：访问 `/` → 302 `/oidc/authenticate/` → 302 跳转 Keycloak authorize（`client_id=hue`）。
+浏览器：**用无痕窗口**打开 DS → 点 Keycloak 登录 → 输 `testuser/Test@12345` → 进入；再点右下角 “Hue ↗” → 已登录态打开 Hue（SSO 成功）。
 
 ---
 
-## 6. 回滚
+## 10. 访问方式
+
+| 系统 | 网址 | 说明 |
+|---|---|---|
+| DolphinScheduler | http://3.89.105.183:12345/dolphinscheduler | Keycloak 登录按钮 + 密码兜底；右下角 “Hue ↗” |
+| EMR Hue | http://3.238.31.232:8888 | 自动跳 Keycloak |
+| Keycloak 管理台 | http://54.221.153.237:8080/admin | admin / Adm1n-Keycloak-2026 |
+| 测试用户 | — | testuser / Test@12345 |
+
+**首次或改完前端后**：用无痕窗口，或清该站点 cookie + 强制刷新（Ctrl+Shift+R），以加载新 JS 并清掉旧的坏 cookie。
+
+---
+
+## 11. 回滚
 
 | 对象 | 备份 | 回滚 |
 |---|---|---|
-| DS `application.yaml` | `.orig` / `.bak-*` / `.bak2`（容器内 `/opt/dolphinscheduler/conf/`） | 还原后 `docker restart dolphinscheduler` |
-| DS `index.html`（Hue 按钮） | `index.html.orig` | 还原（无需重启） |
-| DS 前端 JS（scope 注入） | `index.<hash>.js.orig` | 还原（无需重启） |
+| DS `application.yaml` | 容器内 `.orig` / `.bak-*` | 还原后 `docker restart dolphinscheduler` |
+| DS 前端 JS（scope/cookie 补丁） | `index.<hash>.js.orig` / `.bak-cookiefix` | 还原（无需重启） |
+| DS `index.html`（按钮/守护） | `index.html.orig` | 还原（无需重启） |
 | Hue `hue.ini` | `/etc/hue/conf/hue.ini.bak-*` | 还原后 `sudo systemctl restart hue` |
 | token 适配器 | — | `systemctl disable --now ds-oauth-adapter` |
 
----
-
-## 7. 安全与生产化建议（当前为 POC）
-
-- **全程 HTTP 明文**（含 Keycloak 登录、token 交换）。生产务必启用 **HTTPS**（ALB + ACM 或反向代理 + 证书）。
-- Keycloak 为 `start-dev`（H2 内嵌库、开发模式），`8080` 对公网开放（含管理台）。生产应：换持久化数据库（PostgreSQL）、用 `start`（production 模式）、收紧安全组来源、修改默认 admin 密码、为 realm 设置合理 `sslRequired`。
-- DolphinScheduler 主机内存紧张（可用约 360MB、无 swap），留意 OOM；适配器与 DS 同机，注意资源。
-- token 适配器处理 token/密钥，建议仅监听本机/容器网段，勿对公网暴露 `:9000`。
-- 容器内文件改动（DS `application.yaml`/`index.html`/JS）在 `docker restart` 后保留，但容器**重建**会丢失；生产应做成 bind-mount 或自定义镜像固化。
-- Hue 用户默认非超级管理员，可在 Keycloak 配 `superuser_group` 并在 hue.ini 设置对应映射。
+> ⚠️ 容器内文件改动在 `docker restart` 后保留，但容器**重建**会丢失。生产应做成 bind-mount 或自定义镜像固化。
 
 ---
 
-## 附：关键定位结论（排错备忘）
+## 12. 安全与生产化建议（当前为 POC）
+- **全程 HTTP 明文**（含 Keycloak 登录与 token）。生产务必启用 HTTPS（ALB+ACM 或反向代理+证书）。
+- Keycloak 为 `start-dev`（H2 内嵌库、开发模式）、8080 对公网开放（含管理台）。生产应：换 PostgreSQL、用 `start`（production 模式）、收紧安全组、改默认 admin 密码、设置合理 `sslRequired`。
+- token 适配器处理 token/密钥，建议只监听本机/容器网段，勿对公网暴露 `:9000`。
+- DS 主机内存紧张（无 swap），注意 OOM。
+- 上述前端补丁是对 3.2.1 的临时绕过；升级到支持通用 OIDC 的 DS 版本后可去掉适配器与前端补丁。
+- Hue 用户默认非超级管理员，可在 Keycloak 配 `superuser_group` 并在 hue.ini 设对应项。
 
-- DS 实际运行的是 **Docker 容器**，宿主机 `/opt/apache-dolphinscheduler-3.2.1-bin/...` 是未运行的解压包，改它无效。
-- Cognito 不可行的两个硬约束：① 回调强制 HTTPS（`cannot use the HTTP protocol`）；② DS 3.2.1 OAuth2 是 GitHub 方言，token 格式/`login` 字段不兼容。故选 Keycloak。
-- 登录 403 根因：DS 前端 authorize URL **缺 `scope=openid`** → 非 OIDC token → userInfo 403 → NPE。注入 scope 后修复。
-- issuer 一致性：authorize/token/userinfo 必须用**同一 host**（本方案统一用公网 `54.221.153.237`），否则 token 的 `iss` 与 userinfo 校验 host 不符导致 401/403。
+---
+
+## 13. 排错 FAQ
+
+**登录后 userInfo 返回 403 / 报错**
+→ 前端 authorize URL 缺 `scope=openid`（见 7.1）。检查 `oauth2-provider` 与 Keycloak 客户端 scope。
+
+**登录偶发 500，刷新又能进；日志 `CookieLocaleResolver.java:226` NPE**
+→ `language` cookie 被置空（null 值）。执行 7.2 关闭前端 `DELETE /cookies`，并用无痕/清 cookie 去掉已存在的坏 cookie。
+
+**Keycloak 报 `Missing form parameter: grant_type`**
+→ DS token 请求格式不标准，未走适配器或 `tokenUri` 配错（应指向 `http://172.17.0.1:9000/token`）。
+
+**userInfo 401 / token 校验失败**
+→ authorize 与 token/userinfo 用了不同 host 导致 issuer 不一致。统一用公网 `54.221.153.237`。
+
+**Keycloak 回调 `invalid redirect uri`**
+→ 客户端 `redirectUris` 未包含带 `?provider=keycloak` 的回调；用通配 `.../redirect/login/oauth2*`。
+
+**Hue 跳转后报 SSL/证书错**
+→ `oidc_verify_ssl=false`；HTTP 环境下 realm `sslRequired=NONE`。
