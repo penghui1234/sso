@@ -11,6 +11,7 @@
 
 ## 目录
 1. [架构与原理](#1-架构与原理)
+1.5 [改动点与影响面（必读）](#15-改动点与影响面必读)
 2. [前置条件](#2-前置条件)
 3. [第一步：部署 Keycloak](#3-第一步部署-keycloak)
 4. [第二步：配置 Keycloak（realm/用户/客户端/映射器）](#4-第二步配置-keycloakrealm用户客户端映射器)
@@ -61,6 +62,46 @@
 
 ---
 
+## 1.5 改动点与影响面（必读）
+
+本方案对各组件的"碰触面"如下，便于评估风险与审批。核心结论：**DolphinScheduler 只动 api-server，且后端进程代码零改动**。
+
+### 改哪个进程的配置？——只有 api-server
+SSO/OAuth2 登录逻辑全在 `dolphinscheduler-api`（`LoginController` / `OAuth2Configuration`），由 **api-server** 进程处理 Web 登录、token 交换、userInfo、建会话。master / worker / alert 与 Web 登录无关。
+
+| 进程 | 是否改动 | 说明 |
+|---|---|---|
+| **api-server** | ✅ | 改 `application.yaml` 的 oauth2 段；其托管的前端静态资源打补丁 |
+| master | ❌ | 不涉及 |
+| worker | ❌ | 不涉及 |
+| alert | ❌ | 不涉及 |
+
+> 集群部署：只改 **api-server 节点**。standalone（本指南）四进程合一，共用一份 `/opt/dolphinscheduler/conf/application.yaml`。
+> 若 UI 由独立前端节点（nginx 托管 `dolphinscheduler-ui`）提供，则第五步的前端补丁打在**前端节点**，而非 api-server。
+
+### 要不要动已有进程的代码？——后端零改动
+master/worker/api/alert 的 **Java 后端代码一行未改**。3.2.1 原生 OAuth2 的几处硬编码缺陷全部用"外围"绕过：
+
+| 缺陷（位于 api-server 代码） | 绕过方式 | 动 DS 代码？ | 需重启进程？ |
+|---|---|---|---|
+| userInfo 用户名写死取 `login` 字段 | Keycloak protocol mapper（IdP 侧） | 否 | 否 |
+| token 请求格式非标准（query+JSON body） | 外置 token 适配器（独立 systemd 服务） | 否 | 否 |
+| 前端 authorize 漏 `scope=openid` | 改前端静态产物 `ui/assets/*.js` | 否（UI 静态文件） | 否（刷新即可） |
+| 前端 `DELETE /cookies` 制造空 `language` cookie → locale NPE | 改前端静态产物（关闭该调用） | 否（UI 静态文件） | 否 |
+
+> 唯一"碰 DS 文件"的是 **api-server 托管的前端静态资源**（`ui/...`），属打包产物而非进程运行代码，改完无需重启进程。
+> 如需"代码内正规修复"（去掉适配器+前端补丁），改动点仍只在 api-server：`LoginController.loginByAuth2`（`login` 字段、token 格式）+ 前端 scope/cookie——但需重新编译打包，不在本方案内。
+
+### 配置文件改动点
+DS 侧**只有一处**配置文件：api-server `application.yaml` 的 `security.authentication.oauth2`：
+- `enable: false → true`
+- 新增 `provider.keycloak` 块（authorizationUri / redirectUri / clientId / clientSecret(空) / tokenUri(指向适配器) / userInfoUri / callbackUrl / provider）
+- `security.authentication.type` **保持 `PASSWORD`**（保留密码登录兜底，防锁死）
+- 改完**需重启 api-server**（standalone 重启容器）
+
+其余改动不属于 DS 配置文件（一并列出评估全貌）：token 适配器（DS 主机新增服务）、前端静态文件（scope/cookie/按钮）、Hue `hue.ini`（EMR master）、Keycloak realm/client/mapper（IdP 侧）。
+
+---
 ## 2. 前置条件
 - DS 以容器 `apache/dolphinscheduler-standalone-server:3.2.1` 运行（端口 12345，路径前缀 `/dolphinscheduler`）。
   - ⚠️ 注意运行的是**容器内** `/opt/dolphinscheduler/conf/application.yaml`，不是宿主机解压包。
